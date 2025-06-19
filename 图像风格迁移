@@ -1,0 +1,294 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms, models
+from PIL import Image
+import matplotlib.pyplot as plt
+import numpy as np
+import time
+import os
+from pathlib import Path
+
+# 设置中文字体显示，确保中文标题能正常显示
+plt.rcParams["font.family"] = ["SimHei", "WenQuanYi Micro Hei", "Heiti TC"]
+
+# 设备配置 - 使用GPU加速计算，如果没有可用的GPU则使用CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 图像预处理和后处理转换函数
+# img_size: 图像调整后的尺寸，默认为512x512
+def get_transforms(img_size=512):
+    # Compose函数用于将多个图像转换操作组合在一起
+    transform = transforms.Compose([
+        # 将图像调整为指定的尺寸
+        transforms.Resize((img_size, img_size)),
+        # 将图像转换为Tensor类型
+        transforms.ToTensor(),
+        # 对图像进行归一化处理，使用ImageNet数据集的均值和标准差
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    return transform
+
+# 加载图像函数
+# image_path: 图像文件的路径
+# transform: 图像转换操作，默认为None
+# max_size: 图像的最大尺寸，默认为None
+# shape: 图像的目标形状，默认为None
+def load_image(image_path, transform=None, max_size=None, shape=None):
+    # 检查文件是否存在，如果不存在则抛出异常
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"图像文件不存在: {image_path}")
+    
+    # 打开图像文件并转换为RGB模式
+    image = Image.open(image_path).convert('RGB')
+    
+    # 如果指定了最大尺寸，按比例调整图像大小
+    if max_size:
+        scale = max_size / max(image.size)
+        size = np.array(image.size) * scale
+        image = image.resize(size.astype(int), Image.LANCZOS)
+    
+    # 如果指定了目标形状，直接调整图像大小
+    if shape:
+        image = image.resize(shape, Image.LANCZOS)
+    
+    # 如果有转换操作，对图像进行转换并添加一个批次维度
+    if transform:
+        image = transform(image).unsqueeze(0)
+    
+    # 将图像移动到指定的设备（GPU或CPU）上
+    return image.to(device)
+
+# 将Tensor类型的图像转换为可显示的NumPy数组
+def im_convert(tensor):
+    # 将Tensor从设备上移动到CPU，并克隆一份，然后分离梯度
+    image = tensor.cpu().clone().detach().numpy()
+    # 移除批次维度
+    image = image.squeeze(0)
+    # 调整维度顺序，从(C, H, W)转换为(H, W, C)
+    image = image.transpose(1, 2, 0)
+    # 反归一化处理
+    image = image * np.array((0.229, 0.224, 0.225)) + np.array((0.485, 0.456, 0.406))
+    # 将像素值限制在0到1之间
+    image = image.clip(0, 1)
+    return image
+
+# 获取VGG19网络的特征提取部分
+def get_vgg_features():
+    try:
+        # 尝试使用新版本API加载预训练的VGG19模型
+        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
+    except AttributeError:
+        # 旧版本APIg
+        vgg = models.vgg19(pretrained=True).features
+    
+    # 冻结模型的参数，不进行梯度更新
+    for param in vgg.parameters():
+        param.requires_grad_(False)
+    # 将模型移动到指定的设备上
+    return vgg.to(device)
+
+# 计算格拉姆矩阵
+def gram_matrix(tensor):
+    # 获取Tensor的维度信息
+    _, d, h, w = tensor.size()
+    # 将Tensor调整为二维矩阵
+    tensor = tensor.view(d, h * w)
+    # 计算格拉姆矩阵
+    gram = torch.mm(tensor, tensor.t())
+    return gram
+
+# 构建风格迁移模型类
+class StyleTransferModel:
+    def __init__(self, content_weight=1, style_weight=1e6, style_layers_weights=None):
+        # 获取VGG19的特征提取部分
+        self.vgg = get_vgg_features()
+        # 内容损失的权重
+        self.content_weight = content_weight
+        # 风格损失的权重
+        self.style_weight = style_weight
+        
+        # 内容层的选择及权重
+        self.content_layers = {'conv4_2': 1.0}
+        
+        # 风格层权重
+        if style_layers_weights is None:
+            # 风格层权重
+            self.style_layers = {
+                'conv1_1': 0.4,
+                'conv2_1': 0.1,
+                'conv3_1': 0.8,
+                'conv4_1': 0.4,
+                'conv5_1': 1
+            }
+        else:
+            self.style_layers = style_layers_weights
+        
+        # 定义各层名称的映射关系
+        self.layer_names = {
+            '0': 'conv1_1', '1': 'relu1_1', '2': 'conv1_2', '3': 'relu1_2', '4': 'pool1',
+            '5': 'conv2_1', '6': 'relu2_1', '7': 'conv2_2', '8': 'relu2_2', '9': 'pool2',
+            '10': 'conv3_1', '11': 'relu3_1', '12': 'conv3_2', '13': 'relu3_2', 
+            '14': 'conv3_3', '15': 'relu3_3', '16': 'conv3_4', '17': 'relu3_4', '18': 'pool3',
+            '19': 'conv4_1', '20': 'relu4_1', '21': 'conv4_2', '22': 'relu4_2', 
+            '23': 'conv4_3', '24': 'relu4_3', '25': 'conv4_4', '26': 'relu4_4', '27': 'pool4',
+            '28': 'conv5_1', '29': 'relu5_1', '30': 'conv5_2', '31': 'relu5_2', 
+            '32': 'conv5_3', '33': 'relu5_3', '34': 'conv5_4', '35': 'relu5_4', '36': 'pool5'
+        }
+    
+    # 获取图像在指定层的特征
+    def get_features(self, image):
+        features = {}
+        x = image
+        # 遍历VGG19的每一层
+        for name, layer in self.vgg._modules.items():
+            x = layer(x)
+            # 如果当前层是内容层或风格层，则保存该层的特征
+            if self.layer_names[name] in self.content_layers or self.layer_names[name] in self.style_layers:
+                features[self.layer_names[name]] = x
+        return features
+    
+    # 进行风格迁移的主函数
+    # content_img: 内容图像
+    # style_img: 风格图像
+    # output_img: 初始输出图像，默认为None
+    # epochs: 训练的轮数，默认为500
+    # show_every: 每隔多少轮显示一次中间结果，默认为100
+    # lr: 学习率，默认为0.003
+    def transfer(self, content_img, style_img, output_img=None, epochs=500,
+                show_every=100, lr=0.003):
+        # 初始化输出图像
+        if output_img is None:
+            # 如果没有指定输出图像，使用内容图像作为初始输出
+            output = content_img.clone().requires_grad_(True).to(device)
+        else:
+            output = output_img.clone().requires_grad_(True).to(device)
+        
+        # 定义优化器，使用Adam优化器对输出图像的像素值进行更新
+        optimizer = optim.Adam([output], lr=lr)
+        
+        # 获取内容和风格特征
+        content_features = self.get_features(content_img)
+        style_features = self.get_features(style_img)
+        
+        # 计算风格格拉姆矩阵
+        style_grams = {layer: gram_matrix(style_features[layer]) for layer in style_features}
+        
+        # 记录开始时间
+        start_time = time.time()
+        for epoch in range(epochs):
+            # 获取当前输出的特征
+            output_features = self.get_features(output)
+            
+            # 初始化内容损失和风格损失
+            content_loss = 0
+            style_loss = 0
+            
+            # 计算内容损失
+            for layer in self.content_layers:
+                content_loss += self.content_layers[layer] * torch.mean(
+                    (output_features[layer] - content_features[layer]) ** 2)
+            
+            # 计算风格损失
+            for layer in self.style_layers:
+                output_feature = output_features[layer]
+                output_gram = gram_matrix(output_feature)
+                style_gram = style_grams[layer]
+                _, d, h, w = output_feature.shape
+                layer_style_loss = self.style_layers[layer] * torch.mean((output_gram - style_gram) ** 2)
+                style_loss += layer_style_loss / (d * h * w)
+            
+            # 计算总损失
+            total_loss = self.content_weight * content_loss + self.style_weight * style_loss
+            
+            # 更新输出图像
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+            
+            # 显示中间结果
+            if (epoch + 1) % show_every == 0:
+                elapsed_time = time.time() - start_time
+                print(f'Epoch [{epoch+1}/{epochs}], Total Loss: {total_loss.item():.4f}, '
+                      f'Content Loss: {content_loss.item():.4f}, Style Loss: {style_loss.item():.4f}, '
+                      f'Time: {elapsed_time:.2f}s')
+                
+                plt.figure(figsize=(10, 5))
+                plt.subplot(1, 3, 1)
+                plt.imshow(im_convert(content_img))
+                plt.title('内容图像')
+                plt.axis('off')
+                
+                plt.subplot(1, 3, 2)
+                plt.imshow(im_convert(style_img))
+                plt.title('风格图像')
+                plt.axis('off')
+                
+                plt.subplot(1, 3, 3)
+                plt.imshow(im_convert(output))
+                plt.title(f'输出图像 (Epoch {epoch+1})')
+                plt.axis('off')
+                plt.tight_layout()
+                plt.show()
+        
+        print(f'风格迁移完成！总耗时: {time.time() - start_time:.2f}s')
+        return output
+
+# 主函数
+def main():
+    # 请替换为你的图像路径（使用原始字符串避免转义问题）
+    content_path = 'L:\人工智能导论\\content03.jpg'
+    style_path = 'L:\人工智能导论\\trans01\style1.png'
+    
+    print(f"尝试加载内容图像: {content_path}")
+    print(f"尝试加载风格图像: {style_path}")
+    
+    # 检查文件是否存在
+    if not os.path.exists(content_path):
+        print(f"错误：内容图像文件不存在 - {content_path}")
+        print(f"当前目录内容: {os.listdir(os.path.dirname(content_path))}")
+        return
+    if not os.path.exists(style_path):
+        print(f"错误：风格图像文件不存在 - {style_path}")
+        print(f"当前目录内容: {os.listdir(os.path.dirname(style_path))}")
+        return
+    
+    # 加载图像
+    transform = get_transforms(img_size=512)
+    content = load_image(content_path, transform)
+    style = load_image(style_path, transform, shape=content.shape[-2:])
+    
+    # 创建并运行风格迁移模型
+    model = StyleTransferModel(content_weight=1, style_weight=1e4)
+    
+    # 使用内容图像作为初始输出
+    output = model.transfer(content, style, output_img=content, 
+                           epochs=300, show_every=150, lr=0.015)  
+    
+    # 显示最终结果
+    plt.figure(figsize=(18, 6))
+    plt.subplot(1, 3, 1)
+    plt.imshow(im_convert(content))
+    plt.title('内容图像')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 2)
+    plt.imshow(im_convert(style))
+    plt.title('风格图像')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 3)
+    plt.imshow(im_convert(output))
+    plt.title('风格迁移结果')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    # 保存结果
+    result = im_convert(output)
+    result_image = Image.fromarray((result * 255).astype(np.uint8))
+    result_image.save('style_transfer_result.jpg')
+    print("结果已保存为 'style_transfer_result.jpg'")
+
+if __name__ == "__main__":
+    main()
